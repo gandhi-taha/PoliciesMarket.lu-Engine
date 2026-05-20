@@ -1,0 +1,64 @@
+# Cloud Scheduler jobs for the Layer B quote collector.
+#
+# Each job pings a Cloud Run service URL with an OIDC-authenticated
+# request. The Cloud Run handler should run:
+#
+#     python -m app.workers.quote_collector --provider <code>
+#
+# The orchestrator's ALLOWED_BY_TOS check still gates execution at
+# runtime, so creating these jobs before ToS clearance is harmless —
+# the scraper just refuses and the job exits non-zero (the alerting
+# policy below treats that as "stayed gated", not "broken").
+#
+# Apply with:
+#     gcloud scheduler jobs create http policiesmarket-collector-foyer \
+#       --schedule="0 4 * * 0" --time-zone="Europe/Luxembourg" \
+#       --uri="$WORKER_URL/run?provider=foyer" \
+#       --http-method=POST \
+#       --oidc-service-account-email=policiesmarket-collector@$PROJECT.iam.gserviceaccount.com
+#
+# Or render to gcloud commands from the spec below.
+
+region: europe-west3
+time_zone: Europe/Luxembourg
+
+jobs:
+  - name: policiesmarket-collector-foyer
+    schedule: "0 4 * * 0"          # Sunday 04:00 Europe/Luxembourg, weekly
+    provider_code: foyer
+    description: Layer B quote collection for Foyer car insurance.
+    gated_until_tos_cleared: true
+
+  - name: policiesmarket-collector-lalux
+    schedule: "15 4 * * 0"          # Sunday 04:15
+    provider_code: lalux
+    description: Layer B quote collection for LALUX car insurance.
+    gated_until_tos_cleared: true
+
+  - name: policiesmarket-collector-baloise
+    schedule: "30 4 * * 0"          # Sunday 04:30
+    provider_code: baloise
+    description: Layer B quote collection for Bâloise car insurance.
+    gated_until_tos_cleared: true
+
+  - name: policiesmarket-collector-axa
+    schedule: "45 4 * * 0"          # Sunday 04:45
+    provider_code: axa
+    description: Layer B quote collection for AXA Luxembourg car insurance.
+    gated_until_tos_cleared: true
+
+# Why staggered times: hitting four insurers' marketing CDNs at the
+# same wall-clock minute looks like a coordinated burst. 15-minute
+# offsets keep each origin's per-IP rate clearly humanlike.
+#
+# Why weekly: the rating engine smooths short-term price wobble, so
+# daily collection burns goodwill with insurers for marginal freshness.
+# Weekly + estimate-fallback hits the right tradeoff.
+
+alerting:
+  # Treat ScraperBlockedByToS as INFO, not ERROR — it's the system
+  # working as designed. Treat anything else non-zero as PAGE.
+  blocked_by_tos_is_ok: true
+  page_on:
+    - exit_code != 0 AND not blocked_by_tos
+    - quotes_persisted == 0 for two consecutive weekly runs

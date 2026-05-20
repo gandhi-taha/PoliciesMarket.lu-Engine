@@ -1,0 +1,54 @@
+[project]
+name = "policiesmarket-engine"
+version = "0.1.0"
+description = "Pluggable Luxembourg car insurance recommendation engine (Foyer included)"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "PoliciesMarket.lu" }]
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.112.0",
+  "uvicorn[standard]>=0.30.0",
+  "pydantic>=2.7.0",
+  "pydantic-settings>=2.3.0",
+  "httpx>=0.27.0",
+  "pgvector>=0.3.6",
+  "sqlalchemy>=2.0.30",
+  "psycopg[binary]>=3.1.18",
+  "alembic>=1.13.1",
+  # Required by FastAPI's UploadFile (admin CSV snapshot import).
+  "python-multipart>=0.0.9",
+  # Parses providers.yaml — the single source of truth for which
+  # insurers the engine knows about.
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "pytest-asyncio>=0.23.7",
+  "ruff>=0.5.4",
+  "mypy>=1.10.0",
+]
+# Installed on the ops workstation (not the API container) for the
+# human-in-the-loop assisted collector. See
+# app/workers/assisted_collector.py. After `pip install -e ".[collect]"`,
+# run `playwright install chromium` once.
+collect = [
+  "playwright>=1.45.0",
+]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["alembic*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

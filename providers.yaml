@@ -1,0 +1,65 @@
+# Master provider config.
+#
+# Every entry here becomes:
+#   • a row in settings.providers (config layer)
+#   • a Provider + Product + ProviderConfig in the DB (seed layer)
+#   • a registered snapshot-mode adapter in the registry
+#   • a registered scraper stub in app/workers/scrapers
+#
+# Add an insurer = add an entry below. No code changes.
+#
+# Fields:
+#   code                  short identifier, used everywhere (e.g. "lalux")
+#   name                  human-readable, shown in admin / docs
+#   enabled               if false: skipped by /v1/recommend + bootstrap
+#   product_code          DB code for the bundled product (e.g. "lalux_car")
+#   product_name          human-readable product name
+#   product_line          one of: car (more later)
+#   public_quote_page     URL the assisted collector opens
+#   min_delay_seconds     rate-limit between scraper requests (default 8.0)
+#   allowed_by_tos        flip to true ONLY after the per-insurer entry in
+#                         docs/scraping_compliance.md is signed off.
+#                         Default false. Layer B scrapers refuse to run
+#                         unattended without this. (Tier 2 assisted mode
+#                         ignores this — human in the loop.)
+
+providers:
+  - code: foyer
+    name: Foyer Assurances
+    enabled: true
+    product_code: foyer_car
+    product_name: Foyer Car Protect
+    product_line: car
+    public_quote_page: https://www.foyer.lu/
+    min_delay_seconds: 8.0
+    allowed_by_tos: false
+
+  - code: lalux
+    name: LALUX (La Luxembourgeoise)
+    enabled: true
+    product_code: lalux_car
+    product_name: LALUX lalux-Auto
+    product_line: car
+    public_quote_page: https://www.lalux.lu/
+    min_delay_seconds: 8.0
+    allowed_by_tos: false
+
+  - code: baloise
+    name: Bâloise Assurances Luxembourg
+    enabled: true
+    product_code: baloise_car
+    product_name: Bâloise Auto
+    product_line: car
+    public_quote_page: https://www.baloise.lu/
+    min_delay_seconds: 8.0
+    allowed_by_tos: false
+
+  - code: axa
+    name: AXA Luxembourg
+    enabled: true
+    product_code: axa_car
+    product_name: AXA Auto
+    product_line: car
+    public_quote_page: https://www.axa.lu/
+    min_delay_seconds: 8.0
+    allowed_by_tos: false

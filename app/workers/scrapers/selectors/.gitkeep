@@ -1,0 +1,5 @@
+# Captured selectors per insurer land here as <provider_code>.json.
+# Created by `python -m app.workers.assisted_collector --learn --provider <code>`.
+# The default BaseQuoteScraper.prefill_form() / .extract_result() read
+# this directory at request time, so no code change is needed after
+# a capture run — Tier 2 just starts working.
