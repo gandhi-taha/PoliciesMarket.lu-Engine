@@ -1,316 +1,18 @@
-# policiesmarket-engine
+# PoliciesMarket.lu Engine
 
-Production-style FastAPI service for Luxembourg insurance recommendations.
-Multi-provider out of the box: Foyer, LALUX (La Luxembourgeoise),
-Bâloise, AXA Luxembourg. The adapter, configuration, and data-source
-layers are pluggable — adding another insurer doesn't require touching
-the route code.
+FastAPI backend for PoliciesMarket.lu. It compares car insurance prices from Luxembourg insurers and returns a ranked list of offers for a given driver and car.
 
-This README explains four things:
+## What it is
 
-1. **How to run it** (setup / migrate / seed / serve).
-2. **How quotes are returned** (the recommendation flow end to end).
-3. **[Data acquisition strategy](#data-acquisition-strategy)** — the
-   most important section. It explains how the engine has quote data
-   to recommend with, given no Luxembourg insurer ships a live B2C API.
-4. **API reference** for the endpoints.
+No Luxembourg insurer offers a public quote API, so we work from quote snapshots: prices collected from each insurer's public calculator for a fixed grid of driver and car profiles. If a request doesn't match a collected profile exactly, a per-insurer pricing model estimates the price and labels it as an estimate with a confidence score. The engine runs behind the platform's Next.js front end. It doesn't sell policies; users go to the insurer to buy.
 
----
+Four insurers are configured in `providers.yaml`: Foyer, LALUX, Bâloise and AXA Luxembourg. Car insurance only, for now.
 
-## 1. Requirements
-- Python 3.12
-- PostgreSQL 16 (with `pgvector` extension)
+## How a recommendation works
 
-## Setup
-
-```powershell
-# from the engine folder, with the workspace venv:
-. ..\.venv\Scripts\Activate.ps1
-
-pip install -e ".[dev]"
-alembic upgrade head
-python -m app.db.seed
-uvicorn app.main:app --reload
-```
-
-`docker-compose up --build` does the same in a container with a
-pgvector-enabled Postgres included.
-
----
-
-## 2. How a `/v1/recommend` call works
-
-```
-HTTP POST /v1/recommend
-        │
-        ▼
-┌──────────────────┐
-│ recommend route  │  /v1/recommend?provider=<code>  → single insurer
-│ app/api/         │  /v1/recommend (no provider)    → multi-insurer
-│ recommend.py     │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ recommendation_service.py                                        │
-│                                                                  │
-│  1. Normalize the inquiry into bands                             │
-│     (age, vehicle value, mileage, claims, power, usage)          │
-│                                                                  │
-│  2. For each enabled provider, resolve its ProviderAdapter       │
-│     via registry.py and call find_matching_snapshots():          │
-│       • snapshot mode → SELECT FROM quote_snapshots              │
-│       • live mode     → POST to vendor feed (Foyer only today)   │
-│                                                                  │
-│  3. For any coverage_level the adapter returned no exact-band    │
-│     match for, ask rating_engine.synthesize() to fit + predict   │
-│     a price from the insurer's collected snapshots. Outputs are  │
-│     tagged source='estimated' with confidence < 1.0.             │
-│                                                                  │
-│  4. Merge all snapshots, rank globally by coverage_preference,   │
-│     persist a QuoteRequest + Recommendation audit row, return.   │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-Every offer in the response carries a `source` and a `confidence`:
-
-| `source`        | What it means                                              | UI treatment       |
-| --------------- | ---------------------------------------------------------- | ------------------ |
-| `manual`        | Operator-collected from the insurer's public calculator    | "Verified snapshot from YYYY-MM-DD" |
-| `scraper`       | Layer B Playwright collector (ToS-gated, see §3)           | "Verified snapshot from YYYY-MM-DD" |
-| `partner_feed`  | Live B2B feed (future state per partnership)               | "Live partner quote"                |
-| `estimated`     | Rating engine extrapolation from collected snapshots       | "Estimated · confidence X%"         |
-| `seed`          | Bundled sample data shipped with the repo                  | dev-only           |
-
----
-
-## Data acquisition strategy
-
-The engine works **without insurer APIs** because of how it gets data.
-Three layers, in order of effort and freshness. The planning doc
-(§2.2, §6, §2987-3000) is the source of truth for the strategy; this
-section translates it into code locations.
-
-### Layer A — Operator-collected quote matrix (works today)
-
-What it is:
-- Ops runs each insurer's **public quote calculator** for ~30-60
-  predefined driver profiles (see `app/workers/profile_grid.yaml` for
-  the grid).
-- Records the result in a CSV (one row per profile × coverage level).
-- Uploads via `POST /admin/providers/snapshots/import`.
-
-Two sub-modes, same compliance posture:
-
-- **Tier 1 (manual)** — fully by hand. ~16-24 hours / quarter for 4
-  insurers.
-- **Tier 2 (assisted)** — `python -m app.workers.assisted_collector
-  --provider <code>` opens Chromium, pre-fills the form from the
-  profile grid, waits for the human to submit + handle CAPTCHA, then
-  reads the result DOM and uploads the CSV automatically. Same
-  compliance story (every request is human-initiated), ~5-10 hours /
-  quarter. **Recommended from day one.**
-
-Install Tier 2 prerequisites on the ops machine:
-
-```bash
-pip install -e ".[collect]"
-playwright install chromium
-```
-
-The realistic time + cost numbers and per-quarter schedule live in
-[`docs/ops_collection_runbook.md`](docs/ops_collection_runbook.md).
-
-Where it lives:
-- Endpoint: [`app/api/admin_providers.py`](app/api/admin_providers.py)
-  (the `/snapshots/import` route)
-- Logic: [`app/services/snapshot_import.py`](app/services/snapshot_import.py)
-- CSV schema: documented in the module docstring of `snapshot_import.py`.
-
-Idempotent: re-uploading a corrected CSV deactivates the previous rows
-at the same (provider, product, all bands, coverage, usage_type,
-snapshot_date) key. The rating engine cache is invalidated for any
-(provider, product) touched, so the next `/v1/recommend` call sees the
-new data.
-
-ToS-clean: collecting quotes from a public calculator as a normal user
-isn't scraping — it's the calculator's intended use. The output of
-that work lands here.
-
-### Layer B — Scheduled Playwright collector (framework built, ToS-gated)
-
-What it is:
-- A worker that programmatically fills each insurer's quote form for
-  the same profile grid Layer A uses, on a **weekly schedule**.
-- Each insurer has its own scraper module under
-  [`app/workers/scrapers/`](app/workers/scrapers/) with a hard
-  `ALLOWED_BY_TOS = False` gate.
-
-Where it lives:
-- Orchestrator: [`app/workers/quote_collector.py`](app/workers/quote_collector.py)
-- Base class: [`app/workers/scrapers/base.py`](app/workers/scrapers/base.py)
-- Per-insurer stubs: `app/workers/scrapers/{foyer,lalux,baloise,axa}.py`
-- Profile grid: [`app/workers/profile_grid.yaml`](app/workers/profile_grid.yaml)
-- Compliance checklist (required before enabling):
-  [`docs/scraping_compliance.md`](docs/scraping_compliance.md)
-- Scheduler config: [`deploy/scheduler.yaml`](deploy/scheduler.yaml)
-
-Why it ships disabled: every scraper raises `ScraperBlockedByToS` until
-its per-insurer entry in `docs/scraping_compliance.md` is filled in
-(ToS reviewed, robots.txt fetched, rate budget set, contact attempted,
-legal sign-off recorded) and the in-code flag is flipped. This is on
-purpose — the platform's non-broker positioning (planning doc §247,
-§663-665) depends on us not running unauthorised automation against
-insurers' commercial properties.
-
-Run manually (after a scraper is cleared):
-```
-python -m app.workers.quote_collector --provider foyer --dry-run
-python -m app.workers.quote_collector --provider foyer
-python -m app.workers.quote_collector --provider all
-```
-
-Run on a schedule: see [`deploy/scheduler.yaml`](deploy/scheduler.yaml)
-for the four Cloud Scheduler entries (one per insurer, staggered
-Sunday 04:00–04:45 Europe/Luxembourg, weekly).
-
-### Layer C — Rating-engine extrapolation (always on)
-
-What it is:
-- A per-insurer log-linear pricing model
-  (`log(price) = intercept + α_age + α_value + α_mileage + α_claims +
-  α_power + α_usage`), fit by ordinary least squares from the
-  snapshots collected in Layers A and B.
-- When a recommendation request lands on a profile the matrix doesn't
-  cover exactly, the rating engine synthesises an "estimated" offer.
-  Confidence drops with the number of bands the inquiry shares with
-  the training set; below confidence 0.60 we refuse to return a number
-  rather than fabricate one.
-
-Where it lives:
-- [`app/services/rating_engine.py`](app/services/rating_engine.py)
-
-Why this is the centrepiece: without it, a manually-collected matrix
-of 50 profiles only serves the 50 exact-band combos. With it, the
-same 50 profiles serve the entire band space, with the UI badging
-extrapolated answers honestly. This is what the planning doc §531-533
-calls the `base_price = f(...) × multipliers + addons` engine.
-
-### How they compose
-
-```
-                ┌──────────────────────────────────┐
-                │  POST /v1/recommend (inquiry)    │
-                └────────────────┬─────────────────┘
-                                 │
-                                 ▼
-        ┌─────────────────────────────────────────────┐
-        │ For each enabled adapter:                   │
-        │                                             │
-        │   exact band match in quote_snapshots ?     │
-        │      ├── yes → use it (source = manual /    │
-        │      │         scraper / partner_feed /     │
-        │      │         seed)                        │
-        │      └── no  → ask rating_engine to fit on  │
-        │                this provider's snapshots    │
-        │                and predict — if confidence  │
-        │                ≥ 0.60, return as            │
-        │                source='estimated'           │
-        └─────────────────────┬───────────────────────┘
-                              ▼
-                  Merged ranked offers + audit row
-```
-
-The result: **every inquiry gets offers from every enabled insurer**,
-as long as that insurer has ~5+ collected snapshots in the DB. Layer
-A alone is enough to bootstrap; Layer B keeps the matrix fresh; Layer
-C makes the matrix's coverage universal.
-
-### What none of these layers do
-
-- **Per-request scraping of insurer sites.** The plan rules this out
-  explicitly (§1051, §2975, §3855). We don't ship code for it.
-- **Fabricating prices.** No layer returns a number it didn't either
-  fit from real data or get from a real snapshot.
-- **Distribution.** The engine never sells the policy; the platform
-  always redirects out to the insurer for binding. The data we collect
-  is for comparison, not for closing contracts.
-
----
-
-## 3. Dynamic provider layer
-
-Three knobs decouple "what providers exist" from "how they answer":
-
-**1. Adapter registry** ([`app/providers/registry.py`](app/providers/registry.py))
-— adapters register against `(provider_code, mode)` pairs.
-`get_adapter()` resolves at request time. `iter_enabled_adapters()`
-yields one per enabled provider, used by the multi-provider fan-out.
-
-**2. DB-driven configuration** (`provider_configs` table, migration
-`0004`) — band thresholds and tier metadata live in JSON, editable at
-runtime through admin endpoints:
-
-- `GET  /admin/providers/configs`
-- `GET  /admin/providers/configs/{provider}/{product}`
-- `PUT  /admin/providers/configs` (creates a new version, deactivates
-  the previous one)
-- `POST /admin/providers/snapshots/import` (CSV upload — Layer A pipe)
-
-The normalization service reads the active row on every request. If
-no row exists, the engine falls back to the same hardcoded thresholds
-it shipped with.
-
-**3. Snapshot vs live mode** — set `mode="live"` plus `base_url` /
-`api_key` / `timeout_seconds` on a provider entry in
-`settings.providers` and `LiveFoyerAdapter` (or a future
-`Live<Insurer>Adapter`) will pull quotes from the external feed on
-each call, with an in-memory TTL cache and automatic fallback to the
-DB snapshot adapter on any HTTP failure.
-
-### Adding a new provider
-
-```python
-# app/providers/<name>.py
-from app.providers.snapshot_adapter import SnapshotProviderAdapter
-
-
-class WuestenrotAdapter(SnapshotProviderAdapter):
-    provider_code = "wuestenrot"
-    product_code = "wuestenrot_car"
-    product_line = "car"
-
-
-def _register() -> None:
-    from app.providers.registry import register_adapter
-    register_adapter("wuestenrot", mode="snapshot")(WuestenrotAdapter)
-
-
-_register()
-```
-
-Then:
-
-1. Add an entry to `settings.providers` in [`app/config.py`](app/config.py).
-2. Import the module in `_autoload_builtin_adapters()` in `registry.py`.
-3. Add a `Provider` + `Product` seed entry in `ADDITIONAL_PROVIDERS`
-   in [`app/db/seed.py`](app/db/seed.py).
-4. Add a scraper stub under `app/workers/scrapers/<name>.py` and a
-   section in `docs/scraping_compliance.md`.
-
-The recommend route will resolve the new provider on its next call
-and the multi-provider fan-out will include its offers automatically.
-
----
-
-## 4. API reference
-
-### POST /v1/recommend
-
-Returns ranked offers from one or many providers.
+`POST /v1/recommend` takes a driver and vehicle profile:
 
 ```json
-POST /v1/recommend
 {
   "country": "LU",
   "driver_age": 32,
@@ -325,47 +27,87 @@ POST /v1/recommend
 }
 ```
 
-- `POST /v1/recommend` — fan out across all enabled providers, return
-  the cheapest match across all of them as `best_match`.
-- `POST /v1/recommend?provider=foyer` — single-provider mode (original
-  contract). `best_match` is the cheapest within that insurer.
+1. We normalise the inquiry into bands (age, vehicle value, mileage, claims, power, usage). Band thresholds come from the `provider_configs` table, with built-in defaults if there's no row.
+2. For each enabled insurer, we look up snapshots in the same bands through that insurer's adapter.
+3. For any coverage level without an exact match, `app/services/rating_engine.py` fits a log-linear model on that insurer's snapshots: ordinary least squares on log premium, with one fixed effect per band. It needs at least 5 snapshots and won't return a price below 0.60 confidence.
+4. We merge offers from all insurers and rank them by the requested coverage level. The request and the result are stored for audit.
 
-Response shape includes a `source` and `confidence` per snapshot so
-the consumer can badge `manual` / `scraper` / `partner_feed` /
-`estimated` differently.
+Every offer has a `source` (`manual`, `scraper`, `partner_feed`, `estimated` or `seed`) and a `confidence`, so the UI can show you which prices were collected and which are estimates. If you only want one insurer, add `?provider=foyer` (or another code).
 
-### POST /admin/providers/snapshots/import
+Foyer also has a live-feed adapter (`app/providers/foyer_live.py`) with a TTL cache and a fallback to snapshots on HTTP errors. It's only used if a provider entry is switched to `mode="live"`.
 
-```
-POST /admin/providers/snapshots/import
-Content-Type: multipart/form-data
-file=@layer_a_lalux_2026Q2.csv
-```
+## Getting quote data
 
-CSV schema and idempotency rules are documented in
-[`app/services/snapshot_import.py`](app/services/snapshot_import.py).
-Response is JSON: `{inserted, deactivated, providers_touched, rows_seen}`.
+We get prices in three layers, from most manual to most automated.
 
-### Other endpoints
+- **A. Collected by a person (works today).** Someone runs each insurer's public calculator for the 100 profiles in `app/workers/profile_grid.yaml` and uploads the CSV to `POST /admin/providers/snapshots/import`. The assisted collector (`python -m app.workers.assisted_collector --provider <code>`) opens Chromium via Playwright and pre-fills each form. A person still submits every form and handles any CAPTCHA before it reads the price. Run it once per insurer with `--learn` to record the form selectors. `bootstrap.sh` and `bootstrap.ps1` chain these steps for all enabled insurers and can resume after a break.
+- **B. Scheduled collector (built, switched off).** `app/workers/quote_collector.py` is meant to fill the same forms unattended on a weekly Cloud Scheduler job (`deploy/scheduler.yaml`). Every insurer has `allowed_by_tos: false`, and the scraper refuses to run until its section of `docs/scraping_compliance.md` is filled in: ToS, robots.txt, rate budget, contact attempt and legal sign-off. The generic unattended `collect()` isn't implemented yet either.
+- **C. Estimates.** The rating engine described above fills the gaps between collected profiles.
 
-| Method | Path | Purpose |
-|---|---|---|
-| `POST /v1/query/parse` | Mistral parses free-text inquiries into structured filters |
-| `POST /v1/search/knowledge` | Hybrid (keyword + vector) search over policy documents |
-| `POST /v1/rag/answer` | Grounded LLM answer with citations |
-| `GET /admin/providers/configs` | List provider configs |
-| `GET /admin/providers/configs/{provider}/{product}` | Active config |
-| `PUT /admin/providers/configs` | Upsert config (new version) |
-| `GET /health/live`, `GET /health/ready` | Liveness / readiness probes |
+Our operator workflow is written up in `docs/ops_collection_runbook.md`.
 
----
+## Other endpoints
 
-## 5. Tests
+| Endpoint | What it does |
+|---|---|
+| `POST /v1/query/parse` | Turns a free-text inquiry into structured filters with Mistral. Without `MISTRAL_API_KEY` it only uses the structured fields sent in the request. |
+| `POST /v1/search/knowledge` | Keyword plus vector search over policy documents, merged with reciprocal rank fusion. The embeddings are a deterministic hashing placeholder for now, not a trained model. |
+| `POST /v1/rag/answer` | Answers a question from those documents with citations (Mistral), or returns an "insufficient evidence" response. |
+| `GET /admin/providers/configs`, `GET /admin/providers/configs/{provider}/{product}`, `PUT /admin/providers/configs` | Read and version the band and tier config per insurer. |
+| `POST /admin/providers/snapshots/import` | CSV import of collected quotes. Re-uploading replaces earlier rows for the same key. The schema is in `app/services/snapshot_import.py`. |
+| `GET /health/live`, `GET /health/ready` | Liveness and readiness probes. |
+
+The `/admin` routes don't have authentication yet, so don't expose them to the public internet.
+
+## What's inside
 
 ```
+app/
+  api/          FastAPI routes
+  services/     normalisation, ranking, rating engine, snapshot import, search, RAG
+  providers/    adapter registry, snapshot and Foyer live adapters, Mistral client
+  models/       SQLAlchemy models (migrations in alembic/)
+  workers/      assisted collector, scheduled collector, bootstrap, profile grid
+  db/seed.py    creates insurer rows from providers.yaml and loads sample data
+docs/           collection runbook and scraping compliance checklist
+deploy/         Cloud Scheduler job spec
+scripts/        profile grid generator
+tests/          pytest suite
+```
+
+## How to run
+
+You'll need Python 3.12 and PostgreSQL 16 with the `pgvector` extension. The compose file brings its own Postgres.
+
+With Docker:
+
+```bash
+cp .env.example .env    # add MISTRAL_API_KEY if you want the LLM endpoints
+docker compose up --build
+```
+
+The API container waits for Postgres, runs the migrations and the seed, then serves on port 8000.
+
+Without Docker for the API:
+
+```bash
+docker compose up db
+pip install -e ".[dev]"
+alembic upgrade head
+python -m app.db.seed
+uvicorn app.main:app --reload
+python test_req.py      # sends a sample /v1/recommend request
 pytest
 ```
 
-Coverage hits: normalization, ranking, eligibility, query parser,
-provider registry, provider config, live-adapter cache/fallback,
-knowledge search RRF, RAG grounding, explainer + fallback.
+If you want to run the collector, you'll also need `pip install -e ".[collect]"` and `playwright install chromium`.
+
+The seed only loads sample Foyer quotes and documents, tagged `source='seed'`. On startup the API prints a banner telling you which insurers still have no real data.
+
+## Adding an insurer
+
+Add an entry to `providers.yaml`. The adapter registry, the seed and the scraper factory all read it, so you get a snapshot adapter, the database rows and a disabled scraper without touching code. Only write a custom adapter or scraper if the insurer's site needs special handling.
+
+## Status
+
+It's an early draft, version 0.1.0 (May 2026). Only sample data ships with the repo, so our recommendations aren't based on real prices until we've collected quotes. MIT licence.
